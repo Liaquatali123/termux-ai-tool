@@ -11,6 +11,36 @@ API_BASE = "https://openrouter.ai/api/v1/chat/completions"
 CONFIG = AI / "configs" / "models_config.json"
 KEY_FILE = AI / "configs" / "api_key.json"
 CHAT_HISTORY = AI / "configs" / "chat_history.json"
+PROJECTS = AI.parent / "Projects"
+CWD = Path.cwd()
+
+SYSTEM_PROMPT = """You are an AI coding assistant running in Termux on Android as part of termux-ai-tool. You act like OpenCode — a terminal-native AI for developers.
+
+## Your identity
+- You are a coding expert, not a general chatbot
+- You live in a terminal environment (Termux on Android)
+- You work with Python, JavaScript, Shell, and common languages
+- You are practical and action-oriented
+
+## Response style
+- **Concise by default**: give the answer directly, add detail only when needed
+- **Code-first**: always show code in ```language blocks
+- **Commands**: prefix shell commands with `$ ` or use ```bash
+- **Diffs**: show file path and changes when editing
+- **No padding**: skip "I understand your question" / "Here's how you can..." / "One approach is..."
+- **Natural**: talk like a developer pairing with you, not a textbook
+
+## Examples of good responses
+- User: "make a python test file for this function" → show the file content with ```python, say where to save it
+- User: "fix this error: TypeError: X is not a function" → show the fix with diff, explain briefly
+- User: "how does this work?" → 2-3 sentence explanation + code
+
+## Context
+- Project root: """ + str(PROJECTS) + """
+- AI backend: """ + str(AI) + """
+- Current working dir: """ + str(CWD) + """
+- You use OpenRouter free models with auto-failover
+- You can suggest file paths relative to the project"""
 
 # ---- Shared Engine (same logic as before, no web deps) ----
 
@@ -136,6 +166,19 @@ class TUIChat:
 
         self.input_buf = ""
         self.input_pos = 0
+        self.last_code_block = ""
+        self.project_files = self._scan_project()
+
+    def _scan_project(self):
+        files = []
+        if PROJECTS.exists():
+            for f in sorted(PROJECTS.rglob("*"))[:50]:
+                if f.is_file() and f.suffix in (".py", ".js", ".sh", ".json", ".md", ".txt", ".html", ".css"):
+                    try:
+                        rel = f.relative_to(PROJECTS)
+                        files.append(str(rel))
+                    except: pass
+        return files
 
     def init_colors(self):
         curses.init_pair(1, curses.COLOR_CYAN, -1)
@@ -311,7 +354,7 @@ class TUIChat:
             except: pass
         else:
             try:
-                hints = "Ctrl+N:New  Ctrl+L:Clear  Ctrl+H:History  Ctrl+U:Cancel  Esc:Exit"
+                hints = "Ctrl+N:New  Ctrl+L:Clear  Ctrl+H:History  /write <path>  Esc:Exit"
                 self.stdscr.attron(curses.A_DIM)
                 self.stdscr.addstr(status_y, 0, f"  {hints[:self.width-4]}")
                 self.stdscr.attroff(curses.A_DIM)
@@ -362,8 +405,8 @@ class TUIChat:
         self.conversation.append({"role": "assistant", "content": "", "ts": ts, "_streaming": True})
         self.scroll_offset = max(0, self._total_lines() - self.content_h)
 
-        # Build message list for API
-        msgs = []
+        # Build message list for API — always prepend system prompt
+        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
         for m in self.conversation:
             if m.get("_streaming"):
                 continue
@@ -546,6 +589,22 @@ class TUIChat:
                     self.input_buf = self.input_buf[:self.input_pos] + char + self.input_buf[self.input_pos:]
                     self.input_pos += 1
 
+    def _extract_last_code_block(self, text):
+        import re
+        blocks = re.findall(r"```(\w+)?\n(.*?)```", text, re.DOTALL)
+        if blocks:
+            lang, code = blocks[-1]
+            return code.strip()
+        return ""
+
+    def _write_file(self, path, content):
+        target = Path(path)
+        if not target.is_absolute():
+            target = PROJECTS / target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        return target
+
     def handle_command(self, cmd):
         parts = cmd.split()
         c = parts[0].lower()
@@ -569,8 +628,28 @@ class TUIChat:
                 self.set_status("✅ API key saved")
             else:
                 self.set_status(f"🔑 Key: {self.api_key[:12]}..." if self.api_key else "⚠️ No key")
+        elif c == "/write":
+            if len(parts) < 2:
+                self.set_status("⚠️ Usage: /write <filepath>")
+            else:
+                self.last_code_block = self._extract_last_code_block(
+                    self.conversation[-1]["content"] if self.conversation else ""
+                )
+                if not self.last_code_block:
+                    self.set_status("⚠️ No code block found in last response")
+                else:
+                    fpath = " ".join(parts[1:])
+                    target = self._write_file(fpath, self.last_code_block)
+                    self.last_code_block = ""
+                    self.set_status(f"✅ Created {target}")
+        elif c == "/project":
+            files = self.project_files
+            if not files:
+                self.set_status("📁 No project files found")
+            else:
+                self.set_status(f"📁 {len(files)} files (Ctrl+H to browse)")
         elif c == "/help":
-            self.set_status("/exit /clear /model /models /key /help")
+            self.set_status("/exit /clear /model /models /key /write <path> /project /help")
         else:
             self.set_status(f"❌ Unknown: {c}")
 
