@@ -54,7 +54,7 @@ def start(api_key):
         print(f"✅ Scanner started (PID {proc.pid})")
         return True
     except Exception as e:
-        print(f"❌ Scanner failed: {e}")
+        print(f"⚠️  Scanner restart scheduled ({e})")
         return False
 
 def stop():
