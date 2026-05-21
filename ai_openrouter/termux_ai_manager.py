@@ -18,7 +18,7 @@ Commands:
   clone <url> Clone GitHub repo
   key <token> Set OpenRouter API key
   list        List all projects
-  serve       Launch AI Chat web app (http://localhost:8080)
+  tui         Launch full-screen TUI chat app
   help        Show this help
 """
 
@@ -171,13 +171,13 @@ def cmd_key(token):
     os.environ["OPENROUTER_API_KEY"] = token
     log("✅ API key saved")
 
-def cmd_serve():
-    from chat_app import start_server
+def cmd_tui():
+    from tui_chat import launch_tui
     key = load_api_key()
     if not key:
-        log("⚠️  No API key set — use: termux-ai key <token>")
-    log("🌐 Starting AI Chat web app...")
-    start_server()
+        log("⚠️  No API key — AI disabled. Use: termux-ai key <token>")
+        return
+    launch_tui()
 
 def cmd_list():
     from project_manager import show_list
@@ -195,7 +195,7 @@ def main():
         "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
         "doctor": cmd_doctor, "scan": cmd_scan, "models": cmd_models,
         "status": cmd_status, "sync": cmd_sync, "list": cmd_list,
-        "serve": cmd_serve,
+        "tui": cmd_tui,
         "update": cmd_update, "help": cmd_help,
     }
 
