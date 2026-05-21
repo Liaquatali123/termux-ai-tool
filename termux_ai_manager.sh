@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # termux_ai_manager.sh — Unified Termux AI Tool
-# Installed by install.sh to /data/data/com.termux/files/usr/bin/
+# Self-healing startup. Never hard-fails on recoverable issues.
 
 set -euo pipefail
 
@@ -14,23 +14,13 @@ SCANNER="$AI/live_model_scanner.py"
 
 log() { echo "[$(date +%H:%M:%S)] $*" >> "$LOG_FILE" 2>/dev/null || true; echo "$*"; }
 
-mkdir -p "$PROJECTS" "$AI/configs" "$AI/logs" "$AI/cache"
-
-# === Dependency check ===
-check_deps() {
-  local missing=()
-  for cmd in python3 git curl jq; do
-    if ! command -v "$cmd" &>/dev/null; then missing+=("$cmd"); fi
+# === Ensure core dirs ===
+ensure_dirs() {
+  for d in "$PROJECTS" "$AI/configs" "$AI/logs" "$AI/cache"; do
+    [ -d "$d" ] || { mkdir -p "$d" && log "📁 Created: $d"; }
   done
-  if [ ${#missing[@]} -gt 0 ]; then
-    echo "📦 Installing missing: ${missing[*]}"
-    pkg install -y "${missing[@]}" 2>/dev/null || {
-      echo "❌ Failed to install ${missing[*]}. Run: pkg install ${missing[*]}"
-      exit 1
-    }
-    echo "✅ Dependencies installed"
-  fi
 }
+ensure_dirs
 
 # === Load API key ===
 export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
@@ -39,13 +29,97 @@ if [ -f "$KEY_FILE" ]; then
   [ -n "$KEY" ] && export OPENROUTER_API_KEY="$KEY"
 fi
 
-# === Validation ===
-validate() {
-  local ok=0
-  [ -z "$OPENROUTER_API_KEY" ] && { log "❌ No API key — set with: termux-ai key <token>"; ok=1; }
-  [ ! -d "$AI" ] && { log "❌ AI backend missing: $AI — run: termux-ai install"; ok=1; }
-  [ ! -d "$PROJECTS" ] && { log "❌ Projects path missing: $PROJECTS"; ok=1; }
-  return $ok
+# === Auto-fix: migrate free_model_scanner.py → live_model_scanner.py ===
+[ -f "$AI/free_model_scanner.py" ] && [ ! -f "$SCANNER" ] && {
+  mv "$AI/free_model_scanner.py" "$SCANNER" && log "🔄 Migrated free_model_scanner.py → live_model_scanner.py"
+}
+
+# === Dependency check + auto-install ===
+check_deps() {
+  local missing=() cmds=(python3 git curl jq nodejs)
+  for cmd in "${cmds[@]}"; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  log "📦 Installing missing: ${missing[*]}"
+  pkg install -y "${missing[@]}" >> "$LOG_FILE" 2>&1 || {
+    log "⚠️ Auto-install failed for: ${missing[*]}"
+    log "   Run manually: pkg install ${missing[*]}"
+    return 1
+  }
+  log "✅ Dependencies installed"
+}
+
+# === Storage permission check ===
+check_storage() {
+  if [ ! -d "/storage/emulated/0" ]; then
+    log "⚠️ Storage not accessible"
+    termux-setup-storage 2>/dev/null || true
+    sleep 2
+    if [ ! -d "/storage/emulated/0" ]; then
+      log "⚠️ Storage still unavailable — continuing in limited mode"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# === Self-healing validation (does NOT exit) ===
+auto_repair() {
+  local issues=0 repaired=0
+
+  # 1. Storage
+  check_storage || { issues=$((issues+1)); }
+
+  # 2. Dirs
+  ensure_dirs
+
+  # 3. Dependencies
+  check_deps || { issues=$((issues+1)); }
+
+  # 4. API key
+  if [ -z "$OPENROUTER_API_KEY" ]; then
+    log "⚠️ No API key — AI inference disabled until set"
+    log "   Fix: termux-ai key 'sk-or-v1-...'"
+    issues=$((issues+1))
+  fi
+
+  # 5. Scanner
+  if [ ! -f "$SCANNER" ]; then
+    log "⚠️ Scanner missing: live_model_scanner.py"
+    # Try installing from repo sibling
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo "")"
+    if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/ai_openrouter/live_model_scanner.py" ]; then
+      cp "$SCRIPT_DIR/ai_openrouter/live_model_scanner.py" "$AI/" 2>/dev/null && {
+        log "🔧 Auto-fixed: copied live_model_scanner.py"
+        repaired=$((repaired+1))
+      }
+    fi
+    [ ! -f "$SCANNER" ] && {
+      log "⚠️ Scanner not deployed — run: termux-ai install"
+      issues=$((issues+1))
+    }
+  fi
+
+  # 6. AI backend dir
+  if [ ! -d "$AI" ]; then
+    log "🔧 Creating AI backend dir..."
+    mkdir -p "$AI" && repaired=$((repaired+1))
+  fi
+
+  # 7. AI backend files (missing JS? deploy from repo)
+  if [ ! -f "$AI/autonomous_model_manager.js" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo "")"
+    if [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/ai_openrouter" ]; then
+      cp -rn "$SCRIPT_DIR/ai_openrouter"/* "$AI/" 2>/dev/null && {
+        log "🔧 Deployed AI backend from repo"
+        repaired=$((repaired+1))
+      }
+    fi
+  fi
+
+  [ "$issues" -gt 0 ] && log "⚠️ $issues issue(s) detected, $repaired repaired"
+  return $issues
 }
 
 # === Process manager ===
@@ -59,10 +133,7 @@ proc_manager() {
         start) log "⏩ Scanner already running (PID $pid)"; return 0 ;;
         stop)  kill "$pid" 2>/dev/null || true; rm -f "$PID_FILE"; log "🛑 Scanner stopped"; return 0 ;;
       esac
-    else
-      rm -f "$PID_FILE"
-      [ "$cmd" = "check" ] && return 1
-    fi
+    else rm -f "$PID_FILE"; fi
   fi
   [ "$cmd" = "check" ] && return 1
   return 1
@@ -77,6 +148,7 @@ show_help() {
   echo "  stop              Stop background scanner"
   echo "  install           Deploy/update AI backend files"
   echo "  scan              Run model scanner once"
+  echo "  doctor            Run full diagnostics"
   echo "  clone <url>       Clone GitHub repo into Projects/"
   echo "  sync [project]    Push/pull project changes"
   echo "  list              List all projects with types"
@@ -84,63 +156,136 @@ show_help() {
   echo "  models            Show model scores & latency"
   echo "  key <token>       Set OpenRouter API key"
   echo ""
-  echo "Aliases:"
-  echo "  ai-status  → termux-ai status"
-  echo "  ai-models  → termux-ai models"
-  echo "  ai-scan    → termux-ai scan"
-  echo "  ai-sync    → termux-ai sync"
+  echo "Aliases:  ai-status  ai-models  ai-scan  ai-sync"
 }
 
 case "${1:-help}" in
+  # ===== START =====
   start)
-    check_deps
     echo ""
     echo "╔══════════════════════════════════════════════╗"
     echo "║     🤖 UNIFIED TERMUX AI TOOL              ║"
     echo "╚══════════════════════════════════════════════╝"
     echo ""
-    validate && { log "❌ Validation failed"; exit 1; }
 
-    if [ -f "$SCANNER" ]; then
+    log "🔍 Running system validation..."
+    auto_repair; local repair_exit=$?
+
+    if [ "$repair_exit" -gt 0 ]; then
+      log "🚀 Starting in recovery mode (${repair_exit} issue(s))"
+    else
+      log "✅ Validation passed"
+    fi
+
+    # Start scanner (non-fatal if missing)
+    if [ -f "$SCANNER" ] && [ -n "$OPENROUTER_API_KEY" ]; then
       proc_manager start || {
         nohup python3 "$SCANNER" "$OPENROUTER_API_KEY" --daemon > "$AI/logs/scanner.log" 2>&1 &
         echo "$!" > "$PID_FILE"
         log "✅ Scanner started (PID $!)"
       }
     else
-      log "⚠️ Scanner not found: $SCANNER — run: termux-ai install"
+      [ ! -f "$SCANNER" ] && log "⏩ Scanner skipped (not deployed)"
+      [ -z "$OPENROUTER_API_KEY" ] && log "⏩ Scanner skipped (no API key)"
     fi
 
     echo "📁 Projects: $PROJECTS/"
     echo "📁 AI backend: $AI/"
-    log "✅ All systems active"
+    echo ""
+    log "✅ System ready"
     ;;
 
-  stop)     proc_manager stop ;;
+  # ===== STOP =====
+  stop) proc_manager stop ;;
 
+  # ===== INSTALL =====
   install)
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    SOURCE="$SCRIPT_DIR/ai_openrouter"
-    if [ -d "$SOURCE" ]; then
+    if [ -d "$SCRIPT_DIR/ai_openrouter" ]; then
       mkdir -p "$AI"
-      cp -rn "$SOURCE"/* "$AI/" 2>/dev/null || true
+      cp -rn "$SCRIPT_DIR/ai_openrouter"/* "$AI/" 2>/dev/null || true
       log "✅ AI backend deployed to $AI/"
     else
-      log "⚠️ ai_openrouter/ not found alongside this script"
-      log "   Clone repo: git clone https://github.com/Liaquatali123/termux-ai-tool.git"
+      log "⚠️ ai_openrouter/ not found — clone repo first:"
+      log "   git clone https://github.com/Liaquatali123/termux-ai-tool.git"
     fi
     chmod +x "$AI"/*.py 2>/dev/null || true
     log "✅ Install complete"
     ;;
 
+  # ===== SCAN =====
   scan)
-    check_deps
-    if [ -z "$OPENROUTER_API_KEY" ]; then log "❌ No API key"; exit 1; fi
+    check_deps || true
+    if [ ! -f "$SCANNER" ]; then
+      auto_repair
+    fi
     if [ ! -f "$SCANNER" ]; then log "❌ Scanner not found — run: termux-ai install"; exit 1; fi
+    if [ -z "$OPENROUTER_API_KEY" ]; then log "❌ No API key — set: termux-ai key <token>"; exit 1; fi
     python3 "$SCANNER" "$OPENROUTER_API_KEY" --once 2>&1 | tee -a "$LOG_FILE"
     log "✅ Scan complete"
     ;;
 
+  # ===== DOCTOR =====
+  doctor)
+    echo ""
+    echo "╔══════════════════════════════════════════════╗"
+    echo "║           🔍 SYSTEM DIAGNOSTICS             ║"
+    echo "╚══════════════════════════════════════════════╝"
+    echo ""
+
+    local exit_code=0
+
+    # Storage
+    if [ -d "/storage/emulated/0" ]; then echo "✅ storage   — /storage/emulated/0 accessible"
+    else echo "❌ storage   — not accessible — run: termux-setup-storage"; exit_code=1; fi
+
+    # Dependencies
+    deps_ok=0
+    for cmd in python3 git curl jq nodejs; do
+      command -v "$cmd" &>/dev/null && echo "✅ ${cmd}     — $(command -v "$cmd")" || { echo "❌ ${cmd}     — not found"; deps_ok=1; exit_code=1; }
+    done
+    [ "$deps_ok" -eq 0 ] && echo "✅ All dependencies installed" || echo "⚠️ Some dependencies missing — run: termux-ai start (auto-fixes)"
+
+    # API key
+    if [ -n "$OPENROUTER_API_KEY" ]; then echo "✅ API key  — ${OPENROUTER_API_KEY:0:12}..."
+    else echo "⚠️ API key  — not set — run: termux-ai key <token>"; fi
+
+    # Scanner
+    if [ -f "$SCANNER" ]; then echo "✅ scanner  — $SCANNER"
+    elif [ -f "$AI/free_model_scanner.py" ]; then echo "⚠️ scanner  — free_model_scanner.py exists (needs migration)"
+    else echo "❌ scanner  — not found — run: termux-ai install"; exit_code=1; fi
+
+    # Configs
+    [ -d "$AI/configs" ] && echo "✅ configs  — $AI/configs/" || { echo "❌ configs  — missing"; mkdir -p "$AI/configs" && echo "   (auto-created)"; }
+    if [ -f "$AI/configs/models_config.json" ]; then
+      python3 -c "
+import json
+c = json.load(open('$AI/configs/models_config.json'))
+print(f'   Models: {c.get(\"working_count\",0)} working, {c.get(\"rate_limited_count\",0)} rate-limited')
+print(f'   Fastest: {c.get(\"fastest_model\",\"-\")} ({c.get(\"fastest_ms\",\"-\")}ms)')
+" 2>/dev/null
+    else echo "   (no scan data yet — run: termux-ai scan)"; fi
+
+    # Logs
+    [ -d "$AI/logs" ] && echo "✅ logs     — $AI/logs/" || { echo "❌ logs     — missing"; mkdir -p "$AI/logs"; }
+    [ -f "$LOG_FILE" ] && echo "   Size: $(wc -c < "$LOG_FILE" 2>/dev/null || echo 0) bytes, $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) lines"
+
+    # Cache
+    [ -d "$AI/cache" ] && echo "✅ cache    — $AI/cache/" || { echo "❌ cache    — missing"; mkdir -p "$AI/cache"; }
+    proc_manager check && echo "   Scanner PID: $(cat "$PID_FILE" 2>/dev/null || echo '-')" || echo "   Scanner: not running"
+
+    # Backend files
+    [ -f "$AI/autonomous_model_manager.js" ] && echo "✅ backend  — core files present" || { echo "❌ backend  — missing — run: termux-ai install"; exit_code=1; }
+
+    # Projects
+    [ -d "$PROJECTS" ] && echo "✅ projects — $PROJECTS/ ($(ls -d "$PROJECTS"/*/ 2>/dev/null | wc -l) project(s))" || { echo "⚠️ projects — missing"; mkdir -p "$PROJECTS"; }
+
+    echo ""
+    [ "$exit_code" -eq 0 ] && log "✅ All systems OK" || log "⚠️ $exit_code issue(s) found — run: termux-ai start (auto-repair)"
+    return $exit_code
+    ;;
+
+  # ===== CLONE =====
   clone)
     URL="${2:-}"
     if [ -z "$URL" ]; then log "❌ Usage: termux-ai clone <git-url>"; exit 1; fi
@@ -152,6 +297,7 @@ case "${1:-help}" in
     ls -la "$PROJECTS/$NAME"
     ;;
 
+  # ===== SYNC =====
   sync)
     PROJECT="${2:-}"
     if [ -z "$PROJECT" ]; then
@@ -177,12 +323,12 @@ case "${1:-help}" in
     fi
     ;;
 
+  # ===== LIST =====
   list)
     echo "📁 Projects ($PROJECTS):"
     found=0
     for d in "$PROJECTS"/*/; do
-      [ ! -d "$d" ] && continue
-      found=1
+      [ ! -d "$d" ] && continue; found=1
       NAME=$(basename "$d"); TYPE="?"
       [ -f "$d/package.json" ] && TYPE="Node.js"
       [ -f "$d/requirements.txt" ] && TYPE="Python"
@@ -191,13 +337,12 @@ case "${1:-help}" in
       if [ -d "$d/.git" ]; then
         REMOTE=$(cd "$d" && git remote get-url origin 2>/dev/null || echo "no remote")
         echo "  📂 $NAME  [$TYPE]  → $REMOTE"
-      else
-        echo "  📂 $NAME  [$TYPE]  (local)"
-      fi
+      else echo "  📂 $NAME  [$TYPE]  (local)"; fi
     done
     [ "$found" -eq 0 ] && echo "  (empty — clone a repo: termux-ai clone <url>)"
     ;;
 
+  # ===== STATUS =====
   status)
     echo "╔══════════════════════════════════════════════╗"
     echo "║           SYSTEM STATUS                     ║"
@@ -230,6 +375,7 @@ print(f'🕐 Last scan:         {last}')
     echo "📂 Projects:          $pc"
     ;;
 
+  # ===== MODELS =====
   models)
     if [ -f "$AI/configs/models_config.json" ]; then
       python3 -c "
@@ -248,6 +394,7 @@ for m in c.get('working_models',[]):
     else echo "⏳ Run: termux-ai scan"; fi
     ;;
 
+  # ===== KEY =====
   key)
     TOKEN="${2:-}"
     [ -z "$TOKEN" ] && { log "❌ Usage: termux-ai key <token>"; exit 1; }
