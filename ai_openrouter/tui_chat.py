@@ -47,6 +47,17 @@ COMPRESSED_PROMPT = (
     f"\n\nProject: {PROJECTS}  Backend: {AI}  CWD: {CWD}"
 )
 
+def load_api_key():
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not key and KEY_FILE.exists():
+        try:
+            d = json.loads(KEY_FILE.read_text())
+            key = d.get("key", "")
+        except: pass
+    if key:
+        os.environ["OPENROUTER_API_KEY"] = key
+    return key
+
 # Rolling latency tracker
 class LatencyTracker:
     def __init__(self):
