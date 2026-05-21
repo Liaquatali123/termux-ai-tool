@@ -331,7 +331,16 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 
 def start_server(port=PORT, host="0.0.0.0"):
-    server = ThreadingHTTPServer((host, port), ChatHandler)
+    import socket
+    for attempt in range(20):
+        try:
+            server = ThreadingHTTPServer((host, port), ChatHandler)
+            break
+        except OSError:
+            port += 1
+    else:
+        print(f"  ❌ Could not find available port (tried {PORT}-{port})")
+        return
     print(f"  🌐 AI Chat: http://localhost:{port}")
     print(f"  📱 Network:  http://{host}:{port}")
     print(f"  🛑 Ctrl+C to stop\n")
