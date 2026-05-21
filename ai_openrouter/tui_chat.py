@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tui_chat.py — Full-screen Terminal AI Chat (curses TUI)."""
 
-import sys, json, os, time, threading, queue, urllib.request, urllib.error, re, subprocess
+import sys, json, os, time, threading, queue, urllib.request, urllib.error, re, subprocess, select
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -13,6 +13,42 @@ KEY_FILE = AI / "configs" / "api_key.json"
 CHAT_HISTORY = AI / "configs" / "chat_history.json"
 PROJECTS = AI.parent / "Projects"
 CWD = Path.cwd()
+
+FIRST_TOKEN_TIMEOUT = 5
+STREAM_HANG_TIMEOUT = 5
+
+PREFERRED_MODELS = [
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
+    "minimax/minimax-m2.5:free",
+    "openrouter/free",
+]
+
+def penalize_model(model):
+    if "/" not in model: return
+    try:
+        cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+        details = cfg.setdefault("model_details", {})
+        entry = details.setdefault(model, {})
+        entry["health_score"] = max(0, entry.get("health_score", 50) - 5)
+        entry["last_stall"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        entry["stall_count"] = entry.get("stall_count", 0) + 1
+        cfg["health_pentalized_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        CONFIG.write_text(json.dumps(cfg, indent=2))
+    except: pass
+
+def record_latency(model, ttft=None, full_ms=None):
+    if "/" not in model: return
+    try:
+        cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+        details = cfg.setdefault("model_details", {})
+        entry = details.setdefault(model, {})
+        if ttft is not None:
+            entry["avg_first_token_ms"] = int((entry.get("avg_first_token_ms", 0) + ttft) / 2) if entry.get("avg_first_token_ms") else int(ttft)
+        if full_ms is not None:
+            entry["avg_latency"] = int((entry.get("avg_latency", 0) + full_ms) / 2) if entry.get("avg_latency") else int(full_ms)
+        CONFIG.write_text(json.dumps(cfg, indent=2))
+    except: pass
 
 TOOL_DESC = """## Tools
 You have tools available. To use a tool, include this exact format in your response:
@@ -67,8 +103,17 @@ def load_api_key():
 
 def get_working_models():
     try:
-        cfg = json.loads(CONFIG.read_text())
-        return cfg.get("working_models", cfg.get("fallback_order", ["openrouter/free"]))
+        cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+        models = cfg.get("working_models", cfg.get("fallback_order", []))
+        details = cfg.get("model_details", {})
+        # Sort: preferred first, then by health_score desc, rest at end
+        def sort_key(m):
+            health = details.get(m, {}).get("health_score", 50)
+            pref = PREFERRED_MODELS.index(m) if m in PREFERRED_MODELS else 99
+            return (pref, -health)
+        models = sorted(set(models), key=sort_key)
+        if not models: return ["openrouter/free"]
+        return models
     except: return ["openrouter/free"]
 
 def get_active_model():
@@ -261,8 +306,13 @@ class TUIChat:
                 for l in text.split("\n"): lines.append((-1, f"    {l}"))
 
         if self.streaming:
-            if not lines or lines[-1][1] != "  ...": lines.append((3, "  ..."))
-            else: lines[-1] = (3, "  ...")
+            status_text = "  ..."
+            if self.status_msg and "stalled" in self.status_msg.lower():
+                status_text = f"  ⚠️ switching..."
+            if not lines or lines[-1][1] != status_text:
+                lines.append((3, status_text))
+            else:
+                lines[-1] = (3, status_text)
 
         total = len(lines)
         max_scroll = max(0, total - h)
@@ -369,26 +419,44 @@ class TUIChat:
             full = ""
             self.streaming = True
             self.stream_buffer = ""
+            stalled_models = []
             q = queue.Queue()
             t = threading.Thread(target=self._stream, args=(msgs, q), daemon=True)
             t.start()
+            last_chunk_time = time.monotonic()
             while True:
                 try:
-                    ev = q.get(timeout=0.05)
+                    ev = q.get(timeout=0.1)
                     if ev["type"] == "chunk":
                         full += ev["content"]
                         self.stream_buffer = full
+                        last_chunk_time = time.monotonic()
                     elif ev["type"] == "done":
                         full = ev.get("content", full)
                         self.model = ev.get("model", self.model)
                         self.streaming = False
                         break
+                    elif ev["type"] == "stall":
+                        model = ev.get("model", "?")
+                        stalled_models.append(model)
+                        reason = ev.get("reason", "")
+                        self.set_status(f"⚠️ {model.split('/')[-1]} stalled — switching...")
+                        self.stream_buffer = f"\n  ⚠️ {model.split('/')[-1]} stalled ({reason}), trying next model..."
+                        if self.conversation and self.conversation[-1].get("_streaming"):
+                            self.conversation[-1]["content"] = self.stream_buffer
+                        self.refresh()
                     elif ev["type"] == "error":
                         self.streaming = False
+                        self.set_status(f"❌ {ev.get('error','')}")
                         return full
                 except queue.Empty:
-                    if not self.streaming: break
-            # Done streaming
+                    if not self.streaming:
+                        break
+                    idle = time.monotonic() - last_chunk_time
+                    if idle > 10 and self.streaming:
+                        self.set_status("⚠️ Response delayed — still waiting...")
+                        self.refresh()
+
             if self.conversation and self.conversation[-1].get("_streaming"):
                 self.conversation[-1]["content"] = full
                 self.conversation[-1]["_streaming"] = False
@@ -399,7 +467,6 @@ class TUIChat:
             if not tool_calls:
                 return full
 
-            # Execute tools and collect results
             for name, arg, content in tool_calls:
                 self.set_status(f"🛠 {name} {arg[:30]}...")
                 self.refresh()
@@ -410,8 +477,10 @@ class TUIChat:
                 if name == "write":
                     self.set_status(f"✅ Created {arg}")
                 elif name == "bash":
-                    self.set_status(f"✅ Command done (exit 0)" if result.startswith("exit 0") else f"⚠️ Exit {result.split()[2] if result.startswith('exit') else ''}")
-            # If we had tool calls, continue the loop
+                    rc = "0"
+                    if result.startswith("exit "):
+                        rc = result.split()[2] if len(result.split()) > 2 else "?"
+                    self.set_status(f"✅ Command done (exit {rc})")
             if tool_calls:
                 continue
             return full
@@ -420,7 +489,7 @@ class TUIChat:
 
     def _stream(self, msgs, q):
         models = get_working_models()
-        candidates = list(dict.fromkeys(models + ["openrouter/free"]))
+        candidates = list(dict.fromkeys(models + PREFERRED_MODELS + ["openrouter/free"]))
         for model in candidates:
             payload = json.dumps({
                 "model": model, "messages": msgs,
@@ -436,31 +505,77 @@ class TUIChat:
                 }
             )
             try:
-                resp = urllib.request.urlopen(req, timeout=120)
-                q.put({"type": "meta"})
+                resp = urllib.request.urlopen(req, timeout=30)
+                sock = resp.fp.raw
+                if hasattr(sock, "_sock"): sock = sock._sock
+                q.put({"type": "model_active", "model": model})
                 full = ""
+                got_first = False
+                last_token_time = time.monotonic()
+                start_time = time.monotonic()
+                buffer = b""
+
                 while True:
-                    line = resp.readline()
-                    if not line: break
-                    decoded = line.decode().strip()
-                    if decoded.startswith("data: "):
-                        raw = decoded[6:]
-                        if raw == "[DONE]": break
+                    ready = select.select([sock], [], [], 1.0)
+                    now = time.monotonic()
+                    if ready[0]:
                         try:
-                            data = json.loads(raw)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full += content
-                                q.put({"type": "chunk", "content": content})
-                        except: pass
-                q.put({"type": "done", "content": full, "model": model})
-                return
+                            chunk = resp.read(1)
+                        except: break
+                        if not chunk: break
+                        buffer += chunk
+                        if b"\n" in buffer:
+                            lines = buffer.split(b"\n")
+                            buffer = lines.pop()
+                            for line in lines:
+                                decoded = line.decode().strip()
+                                if decoded.startswith("data: "):
+                                    raw = decoded[6:]
+                                    if raw == "[DONE]":
+                                        q.put({"type": "done", "content": full, "model": model})
+                                        elapsed_ms = int((now - start_time) * 1000)
+                                        record_latency(model, full_ms=elapsed_ms)
+                                        return
+                                    try:
+                                        data = json.loads(raw)
+                                        delta = data.get("choices", [{}])[0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            if not got_first:
+                                                got_first = True
+                                                ttft_ms = int((now - start_time) * 1000)
+                                                record_latency(model, ttft=ttft_ms)
+                                            full += content
+                                            last_token_time = now
+                                            q.put({"type": "chunk", "content": content})
+                                    except: pass
+                    else:
+                        elapsed = now - start_time
+                        if not got_first:
+                            if elapsed > FIRST_TOKEN_TIMEOUT:
+                                penalize_model(model)
+                                q.put({"type": "stall", "model": model, "reason": "no_first_token"})
+                                break
+                        else:
+                            idle = now - last_token_time
+                            if idle > STREAM_HANG_TIMEOUT:
+                                penalize_model(model)
+                                q.put({"type": "stall", "model": model, "reason": "stream_hang"})
+                                break
+                # If we broke out of loop due to stall, continue to next model
+                continue
             except urllib.error.HTTPError as e:
-                if e.code not in (429, 503, 502):
-                    q.put({"type": "error", "error": f"HTTP {e.code}"})
-                    return
-            except: pass
+                if e.code in (429, 503, 502):
+                    q.put({"type": "stall", "model": model, "reason": f"HTTP {e.code}"})
+                    continue
+                q.put({"type": "error", "error": f"HTTP {e.code}"})
+                return
+            except (OSError, urllib.error.URLError) as e:
+                q.put({"type": "stall", "model": model, "reason": "connection_error"})
+                continue
+            except Exception as e:
+                q.put({"type": "stall", "model": model, "reason": "error"})
+                continue
         q.put({"type": "error", "error": "All models exhausted"})
 
     def send_message(self, text):
@@ -472,6 +587,7 @@ class TUIChat:
         ts = time.strftime("%H:%M")
         self.conversation.append({"role": "assistant", "content": "", "ts": ts, "_streaming": True})
         self.scroll_offset = max(0, self._total_lines() - self.content_h)
+        self.set_status("⏳ Waiting for response...")
 
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
         for m in self.conversation:
