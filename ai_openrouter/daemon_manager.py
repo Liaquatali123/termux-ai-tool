@@ -1,12 +1,19 @@
 # daemon_manager.py — PID management, background scanner watchdog
 
-import os, signal, subprocess, time
+import os, signal, subprocess, sys, time
 from pathlib import Path
 from storage_manager import AI
 
 PID_FILE = AI / "cache" / "scanner.pid"
 SCANNER = AI / "live_model_scanner.py"
 LOG = AI / "logs" / "scanner.log"
+
+def _validate_scanner():
+    if not SCANNER.exists():
+        return False, "Scanner not found"
+    if not SCANNER.name.endswith(".py"):
+        return False, f"Invalid scanner type: {SCANNER.name} (must be .py)"
+    return True, "ok"
 
 def is_running():
     if not PID_FILE.exists():
@@ -26,15 +33,19 @@ def start(api_key):
         pid = PID_FILE.read_text().strip()
         print(f"⏩ Scanner already running (PID {pid})")
         return True
-    if not SCANNER.exists():
-        print("⚠️  Scanner not found")
+
+    valid, msg = _validate_scanner()
+    if not valid:
+        print(f"⚠️  {msg}")
         return False
     if not api_key:
         print("⚠️  No API key — scanner not started")
         return False
+
     try:
+        print("🧠 Launching scanner via python3")
         proc = subprocess.Popen(
-            [os.fsdecode(SCANNER), api_key, "--daemon"],
+            [sys.executable, os.fsdecode(SCANNER), api_key, "--daemon"],
             stdout=open(LOG, "a"), stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
