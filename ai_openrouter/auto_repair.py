@@ -1,9 +1,9 @@
-# auto_repair.py — Self-healing system, non-blocking, continues on recoverable issues
+# auto_repair.py — Self-healing system with startup/full modes
 
 import shutil, json
 from pathlib import Path
-from storage_manager import AI, ensure_dirs, check_storage, DIRS
-from dependency_manager import install as install_deps
+from storage_manager import AI, ensure_dirs, check_storage
+from dependency_manager import install as install_deps, missing as missing_deps
 
 SCANNER = AI / "live_model_scanner.py"
 FREE_SCANNER = AI / "free_model_scanner.py"
@@ -13,61 +13,52 @@ BACKEND_FILES = [
     "smart_retry_system.js", "overload_detector.js", "busy_model_tracker.js",
 ]
 
-def repair():
+def verify():
+    """Fast startup check: paths + key + scanner. No package installs."""
     issues = 0
-    fixes = 0
-
-    # 1. Storage (warn only)
+    ensure_dirs()
     if not check_storage():
         print("⚠️  Storage not accessible — continuing in limited mode")
         issues += 1
-
-    # 2. Dirs (always)
-    ensure_dirs()
-
-    # 3. Dependencies (non-blocking)
-    if not install_deps():
-        print("⚠️  Some dependencies may be missing — continuing")
-        issues += 1
-
-    # 4. Migrate scanner
-    if FREE_SCANNER.exists() and not SCANNER.exists():
-        FREE_SCANNER.rename(SCANNER)
-        print("🔄 Migrated free_model_scanner.py → live_model_scanner.py")
-        fixes += 1
-
-    # 5. Deploy scanner from repo sibling
+    md = missing_deps()
+    if md:
+        print(f"⚠️  {len(md)} dep(s) missing — run: termux-ai doctor --repair")
     if not SCANNER.exists():
-        script_dir = Path(__file__).parent
-        src = script_dir / "live_model_scanner.py"
-        if src.exists():
-            shutil.copy2(str(src), str(AI))
-            print("🔧 Deployed live_model_scanner.py")
-            fixes += 1
+        FREE = AI / "free_model_scanner.py"
+        if FREE.exists():
+            FREE.rename(SCANNER)
+            print("🔄 Migrated free_model_scanner.py → live_model_scanner.py")
         else:
-            print("⚠️  Scanner not deployed — scanner unavailable, continuing")
-            issues += 1
-
-    # 6. Core backend files
+            src = Path(__file__).parent / "live_model_scanner.py"
+            if src.exists():
+                shutil.copy2(str(src), str(AI))
+                print("🔧 Deployed live_model_scanner.py")
+            else:
+                print("⚠️  Scanner not deployed — continuing without scanner")
+                issues += 1
     for f in BACKEND_FILES:
         target = AI / f
         if not target.exists():
             src = Path(__file__).parent / f
             if src.exists():
                 shutil.copy2(str(src), str(target))
-                fixes += 1
-
-    # 7. Config file stub
     if not CONFIG_FILE.exists():
         stub = {"timestamp": "", "working_models": ["openrouter/free"],
                 "fallback_order": ["openrouter/free"], "model_details": {},
                 "working_count": 0, "rate_limited_count": 0}
         CONFIG_FILE.write_text(json.dumps(stub, indent=2))
         print("🔧 Created stub config")
-        fixes += 1
+    return issues
 
+def repair():
+    """Full repair: dependencies + everything. Runs on doctor --repair / update."""
+    issues = verify()
+    print("📦 Checking dependencies...")
+    if not install_deps():
+        print("⚠️  Some dependencies could not be installed")
+        issues += 1
     if issues:
-        print(f"⚠️  {issues} issue(s) unresolved, {fixes} fixed — continuing")
+        print(f"⚠️  {issues} issue(s) remaining — run: termux-ai doctor")
     else:
-        print(f"✅ All clear ({fixes} auto-fixes applied)")
+        print("✅ System fully repaired")
     return issues == 0

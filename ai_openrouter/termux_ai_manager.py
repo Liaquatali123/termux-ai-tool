@@ -5,10 +5,12 @@ Usage:
   python3 termux_ai_manager.py <command>
 
 Commands:
-  start       Start AI backend + model scanner
-  stop        Stop background scanner
-  restart     Restart scanner
+  start       Start AI backend (fast check, no package installs)
+  stop        Stop background scanner daemon
+  restart     Graceful scanner restart
   doctor      Run full diagnostics
+  doctor --repair  Full repair + install dependencies
+  update      Full system update (repair + deps + files)
   scan        Run model scanner once
   models      Show model scores & latency
   status      Show system health
@@ -16,6 +18,7 @@ Commands:
   clone <url> Clone GitHub repo
   key <token> Set OpenRouter API key
   list        List all projects
+  update      Full system update (repair + deps)
   help        Show this help
 """
 
@@ -26,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 os.chdir(Path(__file__).parent)
 
 from storage_manager import DIRS, AI, PROJECTS, ensure_dirs
-from auto_repair import repair
+from auto_repair import verify as fast_verify, repair as full_repair
 from runtime_validator import doctor, get_api_key
 from daemon_manager import start as daemon_start, stop as daemon_stop
 from daemon_manager import restart as daemon_restart
@@ -63,8 +66,8 @@ def cmd_start():
     print("║     🤖 UNIFIED TERMUX AI TOOL              ║")
     print("╚══════════════════════════════════════════════╝\n")
 
-    log("🔍 Running auto-repair...")
-    repair()
+    log("🔍 Fast system check...")
+    fast_verify()
 
     key = load_api_key()
     if not key:
@@ -86,7 +89,16 @@ def cmd_restart():
     daemon_restart(key)
 
 def cmd_doctor():
-    doctor()
+    if "--repair" in sys.argv:
+        log("🔧 Running full repair...")
+        full_repair()
+    else:
+        doctor()
+
+def cmd_update():
+    log("🔄 Updating system...")
+    full_repair()
+    log("✅ System updated")
 
 def cmd_scan():
     if not SCANNER.exists():
@@ -175,7 +187,7 @@ def main():
         "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
         "doctor": cmd_doctor, "scan": cmd_scan, "models": cmd_models,
         "status": cmd_status, "sync": cmd_sync, "list": cmd_list,
-        "help": cmd_help,
+        "update": cmd_update, "help": cmd_help,
     }
 
     if cmd == "clone":
