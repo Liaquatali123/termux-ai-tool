@@ -11,15 +11,18 @@ API_BASE = "https://openrouter.ai/api/v1/chat/completions"
 CONFIG = AI / "configs" / "models_config.json"
 KEY_FILE = AI / "configs" / "api_key.json"
 CHAT_HISTORY = AI / "configs" / "chat_history.json"
+ACTIVE_MODEL_FILE = AI / "configs" / "active_model.json"
 PROJECTS = AI.parent / "Projects"
 CWD = Path.cwd()
 
-# Timeouts — set dynamically per request (see detect_message_type)
 FIRST_TOKEN_FAST = 2.5
 FIRST_TOKEN_BALANCED = 5.0
 FIRST_TOKEN_REASONING = 8.0
 STREAM_HANG_TIMEOUT = 5.0
-BLACKLIST_DURATION = 20 * 60  # 20 minutes
+BLACKLIST_DURATION = 20 * 60
+MAX_FAILOVER_TIME = 8.0
+AUTO_RETRY_INTERVAL = 3.0
+SCAN_INTERVAL = 300
 
 FAST_POOL = [
     "nvidia/nemotron-3-nano-30b-a3b:free",
@@ -32,6 +35,11 @@ REASONING_POOL = [
     "google/gemini-2.0-flash-exp:free",
 ]
 PREFERRED_MODELS = FAST_POOL + REASONING_POOL + ["openrouter/free"]
+EMERGENCY_FALLBACK = [
+    "openrouter/free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
+]
 
 COMPRESSED_PROMPT = (
     "You are a terminal-native AI coding assistant (Termux/Android).\n"
@@ -58,7 +66,6 @@ def load_api_key():
         os.environ["OPENROUTER_API_KEY"] = key
     return key
 
-# Rolling latency tracker
 class LatencyTracker:
     def __init__(self):
         self._cache = {}
@@ -110,10 +117,9 @@ class LatencyTracker:
 
 latency_tracker = LatencyTracker()
 
-# Blacklist
 class Blacklist:
     def __init__(self):
-        self._entries = {}  # model → unban_time
+        self._entries = {}
         self._lock = threading.Lock()
 
     def ban(self, model, duration=None):
@@ -142,22 +148,133 @@ class Blacklist:
 
 blacklist = Blacklist()
 
+class ActiveModelCache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.by_type = {}
+        self.last_ok = {}
+        self.fail_count = {}
+        self.health = {}
+        self._load()
+
+    def _load(self):
+        try:
+            if ACTIVE_MODEL_FILE.exists():
+                d = json.loads(ACTIVE_MODEL_FILE.read_text())
+                self.by_type = d.get("by_type", {})
+                self.last_ok = d.get("last_ok", {})
+                self.fail_count = d.get("fail_count", {})
+                self.health = d.get("health", {})
+        except: pass
+
+    def _save(self):
+        try:
+            ACTIVE_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            d = {
+                "by_type": self.by_type,
+                "last_ok": self.last_ok,
+                "fail_count": self.fail_count,
+                "health": self.health,
+                "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            ACTIVE_MODEL_FILE.write_text(json.dumps(d, indent=2))
+        except: pass
+
+    def get(self, msg_type, pool):
+        with self._lock:
+            cached = self.by_type.get(msg_type)
+            if cached and cached in pool and not blacklist.is_banned(cached):
+                h = self.health.get(cached, 50)
+                if h > 0:
+                    return cached
+            candidates = [m for m in pool if not blacklist.is_banned(m)]
+            if not candidates:
+                candidates = pool[:]
+            candidates.sort(key=lambda m: -self.health.get(m, 50))
+            pick = candidates[0] if candidates else "openrouter/free"
+            return pick
+
+    def record_ok(self, model, msg_type):
+        with self._lock:
+            self.by_type[msg_type] = model
+            self.last_ok[model] = time.time()
+            self.fail_count[model] = 0
+            self.health[model] = 60
+            self._save()
+
+    def record_fail(self, model):
+        with self._lock:
+            self.fail_count[model] = self.fail_count.get(model, 0) + 1
+            lat = latency_tracker.get_latency(model)
+            self.health[model] = lat.get("health_score", 0)
+            self._save()
+
+    def all_active(self):
+        with self._lock:
+            return dict(self.by_type)
+
+active_cache = ActiveModelCache()
+
+class ModelScanner:
+    def __init__(self):
+        self._thread = None
+        self.running = False
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        while self.running:
+            time.sleep(SCAN_INTERVAL)
+            try:
+                self._scan()
+            except: pass
+
+    def _scan(self):
+        cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+        details = cfg.get("model_details", {})
+        all_models = cfg.get("working_models", cfg.get("fallback_order", [])) + PREFERRED_MODELS + ["openrouter/free"]
+        seen = set()
+        ranked = []
+        for m in all_models:
+            if m in seen: continue
+            seen.add(m)
+            d = details.get(m, {})
+            h = d.get("health_score", 50)
+            ttft = d.get("avg_ttft_ms", 9999) or 9999
+            s = d.get("stall_count", 0)
+            rank = (-h, s, ttft)
+            ranked.append((rank, m))
+        ranked.sort()
+        cfg["working_models"] = [m for _, m in ranked]
+        CONFIG.write_text(json.dumps(cfg, indent=2))
+
+model_scanner = ModelScanner()
+
 def detect_message_type(text):
     text_lower = text.lower()
     reasoning_kw = ["explain", "how does", "why", "architecture", "design", "compare",
                      "analyze", "debug", "refactor", "optimize", "complex", "architecture",
                      "diagram", "flow", "algorithm", "pattern"]
-    fast_kw = ["hi", "hello", "hey", "yes", "no", "ok", "thanks", "summarize",
-               "short", "quick", "simple", "what is", "who", "when"]
+    fast_kw = ["hi", "hello", "hey", "yes", "thanks", "summarize", "short", "quick", "simple"]
     score = 0
     for kw in reasoning_kw:
         if kw in text_lower: score += 1
     for kw in fast_kw:
-        if kw in text_lower: score -= 1
+        if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+            score -= 1
     if len(text) < 20: score -= 1
     if len(text) > 200: score += 1
     if "```" in text or "def " in text or "function" in text or "class " in text:
         score += 2
+        return "reasoning", FIRST_TOKEN_REASONING, REASONING_POOL
     if score >= 2: return "reasoning", FIRST_TOKEN_REASONING, REASONING_POOL
     if score <= -1: return "fast", FIRST_TOKEN_FAST, FAST_POOL
     return "balanced", FIRST_TOKEN_BALANCED, PREFERRED_MODELS
@@ -191,10 +308,6 @@ def get_working_models():
         return models or ["openrouter/free"]
     except: return ["openrouter/free"]
 
-def get_active_model():
-    m = get_working_models()
-    return m[0] if m else "openrouter/free"
-
 def load_chat_history():
     if CHAT_HISTORY.exists():
         try: return json.loads(CHAT_HISTORY.read_text())
@@ -207,8 +320,6 @@ def save_chat_session(session):
     hist = [h for h in hist if h.get("id") != session.get("id")]
     hist.append(session)
     CHAT_HISTORY.write_text(json.dumps(hist[-20:], indent=2))
-
-# ---- Tools ----
 
 def tool_read(path):
     target = Path(path)
@@ -283,15 +394,13 @@ def parse_tool_calls(text):
         if k not in seen: seen.add(k); uniq.append(c)
     return uniq
 
-# ---- Curses TUI ----
-
 import curses
 
 class TUIChat:
     def __init__(self, stdscr):
         self.stdscr = stdscr
         self.api_key = load_api_key()
-        self.model = get_active_model()
+        self.model = active_cache.get("balanced", PREFERRED_MODELS)
         self.conversation = []
         self.current_chat_id = f"chat_{int(time.time())}"
         self.streaming = False
@@ -308,6 +417,9 @@ class TUIChat:
         self.current_mode = "balanced"
         self.last_ttft = None
         self.last_speed = None
+        self.model_pool = PREFERRED_MODELS
+
+        model_scanner.start()
 
         curses.curs_set(1)
         curses.use_default_colors()
@@ -332,10 +444,8 @@ class TUIChat:
                     except: pass
         return files
 
-    # ---- Drawing ----
-
     def draw_header(self):
-        w = self.get_model_count()
+        active_models = active_cache.all_active()
         md = self.model.split("/")[-1][:14]
         latency = latency_tracker.get_latency(self.model)
         ttft = latency.get("avg_ttft_ms")
@@ -346,7 +456,7 @@ class TUIChat:
         if ttft: left += f" {ttft}ms"
         if speed: left += f" {speed}cps"
         status = "🌐" if self.api_key else "⚠️"
-        right = f"{status} {w} models  "
+        right = f"{status} {len(active_models)} cached | 🔄 bg  "
         if blacklist.list(): right += f"⛔{len(blacklist.list())}  "
         line = left + " " * (self.width - len(left) - len(right)) + right
         self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
@@ -379,8 +489,6 @@ class TUIChat:
 
         if self.streaming:
             st = "  ..."
-            if self.status_msg and "stalled" in self.status_msg.lower():
-                st = "  ⚠️ switching..."
             if not lines or lines[-1][1] != st: lines.append((3, st))
             else: lines[-1] = (3, st)
 
@@ -453,8 +561,6 @@ class TUIChat:
         self.stdscr.noutrefresh()
         curses.doupdate()
 
-    # ---- Messages & Tools ----
-
     def set_status(self, msg):
         self.status_msg = msg; self.status_time = time.time()
 
@@ -481,176 +587,180 @@ class TUIChat:
         if name == "glob": return tool_glob(arg)
         return f"Unknown tool: {name}"
 
-    def _stream(self, msgs, q, timeout_val):
-        models = get_working_models()
-        candidates = list(dict.fromkeys(models + PREFERRED_MODELS + ["openrouter/free"]))
+    def _stream_model(self, model, msgs, q, cancel_event, timeout_val):
+        payload = json.dumps({
+            "model": model, "messages": msgs,
+            "stream": True, "max_tokens": 8192, "temperature": 0.7,
+        }).encode()
+        req = urllib.request.Request(
+            API_BASE, data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/Liaquatali123/termux-ai-tool",
+                "X-Title": "Termux AI",
+            }
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout_val + 2)
+            sock = resp.fp.raw
+            if hasattr(sock, "_sock"): sock = sock._sock
+            q.put({"type": "model_active", "model": model})
+            full = ""
+            got_first = False
+            last_token_time = time.monotonic()
+            start_time = time.monotonic()
+            buf = b""
+
+            while not cancel_event.is_set():
+                ready = select.select([sock], [], [], 0.5)
+                if cancel_event.is_set(): return
+                now = time.monotonic()
+                if ready[0]:
+                    try:
+                        chunk = resp.read(4096)
+                    except: break
+                    if not chunk: break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        decoded = line.decode().strip()
+                        if decoded.startswith("data: "):
+                            raw = decoded[6:]
+                            if raw == "[DONE]":
+                                elapsed_ms = int((now - start_time) * 1000)
+                                latency_tracker.record(model, total_ms=elapsed_ms, char_count=len(full))
+                                q.put({"type": "done", "content": full, "model": model})
+                                return
+                            try:
+                                data = json.loads(raw)
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    if not got_first:
+                                        got_first = True
+                                        ttft_ms = int((now - start_time) * 1000)
+                                        latency_tracker.record(model, ttft=ttft_ms)
+                                        q.put({"type": "ttft", "ms": ttft_ms})
+                                    full += content
+                                    last_token_time = now
+                                    q.put({"type": "chunk", "content": content})
+                            except: pass
+                else:
+                    elapsed = now - start_time
+                    if not got_first:
+                        if elapsed > timeout_val:
+                            penalize_model(model)
+                            q.put({"type": "stall", "model": model, "reason": "no_first_token"})
+                            return
+                    else:
+                        if now - last_token_time > STREAM_HANG_TIMEOUT:
+                            penalize_model(model)
+                            q.put({"type": "stall", "model": model, "reason": "stream_hang"})
+                            return
+        except urllib.error.HTTPError as e:
+            q.put({"type": "stall", "model": model, "reason": f"HTTP {e.code}"})
+            return
+        except (OSError, urllib.error.URLError):
+            q.put({"type": "stall", "model": model, "reason": "connection_error"})
+            return
+        except Exception:
+            q.put({"type": "stall", "model": model, "reason": "error"})
+            return
+        q.put({"type": "done", "content": full, "model": model})
+
+    def _try_failover(self, msgs, timeout_val, pool, mode):
+        primary = active_cache.get(mode, pool)
+        candidates = list(dict.fromkeys([primary] + pool + EMERGENCY_FALLBACK))
+        failover_start = time.monotonic()
+
         for model in candidates:
             if blacklist.is_banned(model): continue
-            payload = json.dumps({
-                "model": model, "messages": msgs,
-                "stream": True, "max_tokens": 8192, "temperature": 0.7,
-            }).encode()
-            req = urllib.request.Request(
-                API_BASE, data=payload,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/Liaquatali123/termux-ai-tool",
-                    "X-Title": "Termux AI",
-                }
-            )
-            try:
-                resp = urllib.request.urlopen(req, timeout=timeout_val + 2)
-                sock = resp.fp.raw
-                if hasattr(sock, "_sock"): sock = sock._sock
-                q.put({"type": "model_active", "model": model})
-                full = ""
-                got_first = False
-                last_token_time = time.monotonic()
-                start_time = time.monotonic()
-                buf = b""
-                # Read in chunks, flush immediately
-                while True:
-                    ready = select.select([sock], [], [], 0.5)
-                    now = time.monotonic()
-                    if ready[0]:
-                        try:
-                            chunk = resp.read(4096)
-                        except: break
-                        if not chunk: break
-                        buf += chunk
-                        # Process line by line, flush tokens immediately
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            decoded = line.decode().strip()
-                            if decoded.startswith("data: "):
-                                raw = decoded[6:]
-                                if raw == "[DONE]":
-                                    elapsed_ms = int((now - start_time) * 1000)
-                                    latency_tracker.record(model, total_ms=elapsed_ms, char_count=len(full))
-                                    q.put({"type": "done", "content": full, "model": model})
-                                    return
-                                try:
-                                    data = json.loads(raw)
-                                    delta = data.get("choices", [{}])[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        if not got_first:
-                                            got_first = True
-                                            ttft_ms = int((now - start_time) * 1000)
-                                            latency_tracker.record(model, ttft=ttft_ms)
-                                            q.put({"type": "ttft", "ms": ttft_ms})
-                                        full += content
-                                        last_token_time = now
-                                        q.put({"type": "chunk", "content": content})
-                                except: pass
-                    else:
-                        elapsed = now - start_time
-                        if not got_first:
-                            if elapsed > timeout_val:
-                                penalize_model(model)
-                                blacklist.ban(model) if latency_tracker.get_latency(model).get("stall_count", 0) >= 2 else None
-                                q.put({"type": "stall", "model": model, "reason": "no_first_token"})
-                                break
-                        else:
-                            if now - last_token_time > STREAM_HANG_TIMEOUT:
-                                penalize_model(model)
-                                q.put({"type": "stall", "model": model, "reason": "stream_hang"})
-                                break
-                continue
-            except urllib.error.HTTPError as e:
-                if e.code in (429, 503, 502):
-                    q.put({"type": "stall", "model": model, "reason": f"HTTP {e.code}"})
-                    continue
-                q.put({"type": "error", "error": f"HTTP {e.code}"})
-                return
-            except (OSError, urllib.error.URLError):
-                q.put({"type": "stall", "model": model, "reason": "connection_error"})
-                continue
-            except Exception:
-                q.put({"type": "stall", "model": model, "reason": "error"})
-                continue
-        q.put({"type": "error", "error": "All models exhausted"})
 
-    def _stream_with_fallback(self, msgs, q, timeout_val):
-        """Launch primary stream + parallel fallback if timeout approaches."""
-        fallback_q = queue.Queue()
-        primary_t = threading.Thread(target=self._stream, args=(msgs, q, timeout_val), daemon=True)
-        primary_t.start()
-        # Start a fallback thread that kicks in if primary stalls
-        fallback_t = threading.Thread(
-            target=self._fallback_watchdog, args=(primary_t, msgs, q, fallback_q, timeout_val), daemon=True
-        )
-        fallback_t.start()
+            # Hard total failover timeout — skip remaining candidates
+            if time.monotonic() - failover_start > MAX_FAILOVER_TIME:
+                continue
 
-    def _fallback_watchdog(self, primary_t, msgs, main_q, fb_q, timeout_val):
-        """If primary doesn't produce first token in time, launch fallback model."""
-        deadline = time.time() + max(1.5, timeout_val - 1)
-        got_chunk = False
-        while time.time() < deadline:
-            if not primary_t.is_alive():
-                return  # primary finished
-            time.sleep(0.1)
-        # Check if primary produced anything
-        # We can't easily peek into main_q, so check if streaming status changed
-        if got_chunk:
-            return
-        # Launch fallback with openrouter/free in parallel
-        fallback_msgs = [{"role": "system", "content": COMPRESSED_PROMPT}]
-        for m in msgs:
-            if m.get("role") == "system": continue
-            fallback_msgs.append(m)
-        t = threading.Thread(
-            target=self._stream, args=(fallback_msgs, main_q, timeout_val), daemon=True
-        )
-        t.start()
-
-    def _agent_loop(self, initial_msgs, timeout_val, mode):
-        max_turns = 5
-        msgs = list(initial_msgs)
-        for turn in range(max_turns):
-            full = ""
-            self.streaming = True
-            self.stream_buffer = ""
-            stalled_models = []
             q = queue.Queue()
-            self._stream_with_fallback(msgs, q, timeout_val)
-            last_chunk_time = time.monotonic()
-            ttft_ms = None
-            start_time = time.monotonic()
+            cancel_event = threading.Event()
+            t = threading.Thread(target=self._stream_model, args=(model, msgs, q, cancel_event, timeout_val), daemon=True)
+            t.start()
 
-            while True:
+            full = ""
+            ttft_ms = None
+            done = False
+            active_name = model.split("/")[-1]
+            attempt_start = time.monotonic()
+            self.set_status(f"🔄 {active_name}...")
+
+            # Hard per-attempt timeout: don't wait more than this for any event
+            per_attempt_timeout = max(3.0, timeout_val)
+
+            while t.is_alive() or not q.empty():
+                if time.monotonic() - attempt_start > per_attempt_timeout:
+                    self.set_status(f"⚠️ {active_name} timeout")
+                    break
+
                 try:
                     ev = q.get(timeout=0.05)
                     if ev["type"] == "chunk":
                         full += ev["content"]
                         self.stream_buffer = full
-                        last_chunk_time = time.monotonic()
                     elif ev["type"] == "ttft":
                         ttft_ms = ev["ms"]
                         self.last_ttft = ttft_ms
+                    elif ev["type"] == "model_active":
+                        self.set_status(f"✅ {active_name}")
                     elif ev["type"] == "done":
                         full = ev.get("content", full)
                         self.model = ev.get("model", self.model)
-                        self.streaming = False
-                        elapsed = int((time.monotonic() - start_time) * 1000)
-                        speed = round(len(full) / (elapsed / 1000), 1) if elapsed > 0 else 0
-                        self.last_speed = speed
+                        done = True
                         break
                     elif ev["type"] == "stall":
-                        model = ev.get("model", "?")
-                        stalled_models.append(model)
-                        self.set_status(f"⚠️ {model.split('/')[-1]} stalled — switching...")
-                        self.stream_buffer = f"\n  ⚠️ {model.split('/')[-1]} stalled ({ev.get('reason','')}), trying next..."
-                        if self.conversation and self.conversation[-1].get("_streaming"):
-                            self.conversation[-1]["content"] = self.stream_buffer
-                        self.refresh()
+                        self.set_status(f"❌ {active_name} failed ({ev.get('reason','')})")
+                        blacklist.ban(model, 300)
+                        break
                     elif ev["type"] == "error":
-                        self.streaming = False
                         self.set_status(f"❌ {ev.get('error','')}")
-                        return full
+                        blacklist.ban(model, 300)
+                        break
                 except queue.Empty:
-                    if not self.streaming: break
+                    continue
+
+            cancel_event.set()
+            t.join(timeout=1)
+
+            if done:
+                active_cache.record_ok(self.model, mode)
+                elapsed_t = int((time.monotonic() - failover_start) * 1000)
+                speed = round(len(full) / max(elapsed_t, 1) * 1000, 1)
+                self.last_speed = speed
+                return full, ttft_ms
+
+        return None, None
+
+    def _agent_loop(self, initial_msgs, timeout_val, mode, pool):
+        max_turns = 5
+        msgs = list(initial_msgs)
+        retry_count = 0
+        for turn in range(max_turns):
+            self.streaming = True
+            self.stream_buffer = ""
+
+            full, ttft_ms = self._try_failover(msgs, timeout_val, pool, mode)
+
+            if full is None:
+                retry_count += 1
+                self.set_status(f"❌ all models busy (attempt {retry_count}) — retrying...")
+                while full is None:
+                    self.refresh()
+                    time.sleep(AUTO_RETRY_INTERVAL)
+                    retry_count += 1
+                    self.set_status(f"🔄 retry {retry_count}...")
+                    full, ttft_ms = self._try_failover(msgs, timeout_val, pool, mode)
+                self.set_status(f"✅ {self.model.split('/')[-1]} recovered")
+
+            self.streaming = False
 
             if self.conversation and self.conversation[-1].get("_streaming"):
                 self.conversation[-1]["content"] = full
@@ -689,7 +799,9 @@ class TUIChat:
 
         mode, timeout_val, pool = detect_message_type(text)
         self.current_mode = mode
-        self.set_status(f"⏳ {mode} mode ({int(timeout_val*1000)}ms timeout)...")
+        self.model_pool = pool
+        mdl = active_cache.get(mode, pool)
+        self.set_status(f"⚡ {mode} | 🧠 {mdl.split('/')[-1]}")
 
         msgs = [{"role": "system", "content": COMPRESSED_PROMPT}]
         for m in self.conversation:
@@ -697,7 +809,7 @@ class TUIChat:
             msgs.append({"role": m["role"], "content": m["content"]})
 
         def agent_worker():
-            result = self._agent_loop(msgs, timeout_val, mode)
+            result = self._agent_loop(msgs, timeout_val, mode, pool)
             self.streaming = False
             if self.conversation and self.conversation[-1].get("_streaming"):
                 self.conversation[-1]["content"] = result
@@ -720,8 +832,6 @@ class TUIChat:
 
         threading.Thread(target=agent_worker, daemon=True).start()
 
-    # ---- Navigation ----
-
     def toggle_history(self):
         self.mode = "history" if self.mode == "chat" else "chat"
         self.history_idx = 0
@@ -740,14 +850,12 @@ class TUIChat:
         self.scroll_offset = max(0, self._total_lines() - self.content_h)
         self.set_status(f"📜 Loaded from {c.get('timestamp','')[:10]}")
 
-    # ---- Commands ----
-
     def handle_command(self, cmd):
         parts = cmd.split()
         c = parts[0].lower()
         if c == "/exit": raise KeyboardInterrupt
         elif c == "/clear": self.conversation = []; self.stream_buffer = ""; self.scroll_offset = 0; self.set_status("✅ Cleared")
-        elif c == "/model": self.set_status(f"🧠 {self.model} ({self.get_model_count()} models)")
+        elif c == "/model": self.set_status(f"🧠 {self.model} | cached: {active_cache.all_active()}")
         elif c == "/models": ms = get_working_models(); self.set_status(f"📊 {', '.join(m.split('/')[-1][:15] for m in ms[:5])}")
         elif c == "/latency":
             l = latency_tracker.get_latency(self.model)
@@ -786,8 +894,6 @@ class TUIChat:
 
     def get_model_count(self):
         return len(get_working_models())
-
-    # ---- Main Loop ----
 
     def run(self):
         while True:
