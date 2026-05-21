@@ -233,16 +233,16 @@ case "${1:-help}" in
     echo "╚══════════════════════════════════════════════╝"
     echo ""
 
-    local exit_code=0
+    _ec=0
 
     # Storage
     if [ -d "/storage/emulated/0" ]; then echo "✅ storage   — /storage/emulated/0 accessible"
-    else echo "❌ storage   — not accessible — run: termux-setup-storage"; exit_code=1; fi
+    else echo "❌ storage   — not accessible — run: termux-setup-storage"; _ec=1; fi
 
     # Dependencies
     deps_ok=0
     for cmd in python3 git curl jq nodejs; do
-      command -v "$cmd" &>/dev/null && echo "✅ ${cmd}     — $(command -v "$cmd")" || { echo "❌ ${cmd}     — not found"; deps_ok=1; exit_code=1; }
+      command -v "$cmd" &>/dev/null && echo "✅ ${cmd}     — $(command -v "$cmd")" || { echo "❌ ${cmd}     — not found"; deps_ok=1; _ec=1; }
     done
     [ "$deps_ok" -eq 0 ] && echo "✅ All dependencies installed" || echo "⚠️ Some dependencies missing — run: termux-ai start (auto-fixes)"
 
@@ -253,7 +253,7 @@ case "${1:-help}" in
     # Scanner
     if [ -f "$SCANNER" ]; then echo "✅ scanner  — $SCANNER"
     elif [ -f "$AI/free_model_scanner.py" ]; then echo "⚠️ scanner  — free_model_scanner.py exists (needs migration)"
-    else echo "❌ scanner  — not found — run: termux-ai install"; exit_code=1; fi
+    else echo "❌ scanner  — not found — run: termux-ai install"; _ec=1; fi
 
     # Configs
     [ -d "$AI/configs" ] && echo "✅ configs  — $AI/configs/" || { echo "❌ configs  — missing"; mkdir -p "$AI/configs" && echo "   (auto-created)"; }
@@ -275,14 +275,13 @@ print(f'   Fastest: {c.get(\"fastest_model\",\"-\")} ({c.get(\"fastest_ms\",\"-\
     proc_manager check && echo "   Scanner PID: $(cat "$PID_FILE" 2>/dev/null || echo '-')" || echo "   Scanner: not running"
 
     # Backend files
-    [ -f "$AI/autonomous_model_manager.js" ] && echo "✅ backend  — core files present" || { echo "❌ backend  — missing — run: termux-ai install"; exit_code=1; }
+    [ -f "$AI/autonomous_model_manager.js" ] && echo "✅ backend  — core files present" || { echo "❌ backend  — missing — run: termux-ai install"; _ec=1; }
 
     # Projects
     [ -d "$PROJECTS" ] && echo "✅ projects — $PROJECTS/ ($(ls -d "$PROJECTS"/*/ 2>/dev/null | wc -l) project(s))" || { echo "⚠️ projects — missing"; mkdir -p "$PROJECTS"; }
 
     echo ""
-    [ "$exit_code" -eq 0 ] && log "✅ All systems OK" || log "⚠️ $exit_code issue(s) found — run: termux-ai start (auto-repair)"
-    return $exit_code
+    [ "$_ec" -eq 0 ] && log "✅ All systems OK" || log "⚠️ $_ec issue(s) — run: termux-ai start (auto-repair)"
     ;;
 
   # ===== CLONE =====
