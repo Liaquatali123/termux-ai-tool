@@ -1,0 +1,36 @@
+# Termux AI Tool — .gitignore
+
+# API keys & secrets
+api_key.json
+.env
+*.key
+secrets/
+
+# Configs (user-specific)
+configs/api_key.json
+configs/*.json
+
+# Logs
+logs/
+*.log
+
+# Cache
+cache/
+__pycache__/
+*.pyc
+
+# Temp
+tmp/
+temp/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
