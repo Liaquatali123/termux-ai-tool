@@ -70,7 +70,10 @@ def cmd_start():
     if not key:
         log("⚠️  No API key — AI disabled until: termux-ai key <token>")
 
-    daemon_start(key)
+    result = daemon_start(key)
+    if not result and key:
+        log("⚠️  Scanner unavailable — retrying in background")
+
     print(f"📁 Projects: {PROJECTS}/")
     print(f"📁 AI backend: {AI}/")
     log("✅ System ready")
