@@ -82,13 +82,14 @@ def main():
         "alias ai-models='termux-ai models'",
         "alias ai-scan='termux-ai scan'",
         "alias ai-sync='termux-ai sync'",
+        "alias ai-serve='termux-ai serve'",
     ]
     bashrc = BASHRC.read_text() if BASHRC.exists() else ""
     for a in aliases:
         if a not in bashrc:
             bashrc += a + "\n"
     BASHRC.write_text(bashrc)
-    ok("Aliases added: ai-status, ai-models, ai-scan, ai-sync")
+    ok("Aliases added: ai-status, ai-models, ai-scan, ai-sync, ai-serve")
 
     # Done
     print("\n╔══════════════════════════════════════════════╗")
@@ -104,6 +105,8 @@ def main():
     print("     termux-ai start\n")
     print("  5. Clone a project:")
     print("     termux-ai clone https://github.com/user/repo.git\n")
+    print("  6. Launch AI Chat web app:")
+    print("     termux-ai serve\n")
     print("  Reload: source ~/.bashrc\n")
 
 if __name__ == "__main__":
