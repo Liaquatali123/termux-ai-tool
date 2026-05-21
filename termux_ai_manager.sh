@@ -127,7 +127,7 @@ case "${1:-help}" in
       log "✅ AI backend deployed to $AI/"
     else
       log "⚠️ ai_openrouter/ not found alongside this script"
-      log "   Clone repo: git clone https://github.com/anomalyco/termux-ai-tool.git"
+      log "   Clone repo: git clone https://github.com/Liaquatali123/termux-ai-tool.git"
     fi
     chmod +x "$AI"/*.py 2>/dev/null || true
     log "✅ Install complete"

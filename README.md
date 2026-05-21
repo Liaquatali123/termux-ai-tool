@@ -5,7 +5,7 @@ Unified AI development environment for Android Termux — OpenRouter free models
 ## One-line Install
 
 ```bash
-pkg update -y && pkg install git -y && git clone https://github.com/anomalyco/termux-ai-tool.git && cd termux-ai-tool && bash install.sh
+pkg update -y && pkg install git -y && git clone https://github.com/Liaquatali123/termux-ai-tool.git && cd termux-ai-tool && bash install.sh
 ```
 
 After install, reload your shell:
