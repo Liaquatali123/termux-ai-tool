@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tui_chat.py — Full-screen Terminal AI Chat (curses TUI)."""
 
-import sys, json, os, time, threading, queue, urllib.request, urllib.error, re, subprocess, select, math
+import sys, json, os, time, threading, queue, urllib.request, urllib.error, re, subprocess, select, math, shutil
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -12,6 +12,8 @@ CONFIG = AI / "configs" / "models_config.json"
 KEY_FILE = AI / "configs" / "api_key.json"
 CHAT_HISTORY = AI / "configs" / "chat_history.json"
 ACTIVE_MODEL_FILE = AI / "configs" / "active_model.json"
+SESSION_DIR = AI / "sessions"
+LAST_SESSION_FILE = SESSION_DIR / "last_session.json"
 PROJECTS = AI.parent / "Projects"
 CWD = Path.cwd()
 
@@ -258,6 +260,130 @@ class ModelScanner:
 
 model_scanner = ModelScanner()
 
+class SessionManager:
+    def __init__(self):
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+    def create(self, name=None):
+        session_id = name or f"ses_{os.urandom(12).hex()}"
+        path = SESSION_DIR / session_id
+        path.mkdir(parents=True, exist_ok=True)
+        self._write_history(session_id, [])
+        self._write_state(session_id, {
+            "model": "openrouter/free",
+            "mode": "balanced",
+            "cwd": str(CWD),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        self._write_context(session_id, {})
+        self.set_last(session_id)
+        return session_id
+
+    def load(self, session_id):
+        path = SESSION_DIR / session_id
+        if not path.is_dir():
+            return None
+        return {
+            "history": self._read_history(session_id),
+            "state": self._read_state(session_id),
+            "context": self._read_context(session_id),
+        }
+
+    def save_conversation(self, session_id, conversation):
+        self._write_history(session_id, conversation)
+        state = self._read_state(session_id)
+        state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._write_state(session_id, state)
+
+    def save_state(self, session_id, updates):
+        state = self._read_state(session_id)
+        state.update(updates)
+        state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._write_state(session_id, state)
+
+    def list_sessions(self):
+        sessions = []
+        for p in sorted(SESSION_DIR.iterdir()):
+            if p.is_dir():
+                state = self._read_state(p.name)
+                hist = self._read_history(p.name)
+                sessions.append({
+                    "id": p.name,
+                    "name": state.get("name", ""),
+                    "created": state.get("created", ""),
+                    "updated": state.get("updated", ""),
+                    "model": state.get("model", ""),
+                    "message_count": len(hist),
+                })
+        return sorted(sessions, key=lambda s: s.get("updated", ""), reverse=True)
+
+    def delete(self, session_id):
+        shutil.rmtree(str(SESSION_DIR / session_id), ignore_errors=True)
+
+    def rename(self, session_id, new_name):
+        state = self._read_state(session_id)
+        state["name"] = new_name
+        self._write_state(session_id, state)
+
+    def exists(self, session_id):
+        return (SESSION_DIR / session_id).is_dir()
+
+    def get_last(self):
+        try:
+            if LAST_SESSION_FILE.exists():
+                d = json.loads(LAST_SESSION_FILE.read_text())
+                sid = d.get("last_session")
+                if sid and self.exists(sid):
+                    return sid
+        except: pass
+        return None
+
+    def set_last(self, session_id):
+        try:
+            LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            LAST_SESSION_FILE.write_text(json.dumps({"last_session": session_id}))
+        except: pass
+
+    def _history_path(self, sid): return SESSION_DIR / sid / "history.json"
+    def _state_path(self, sid): return SESSION_DIR / sid / "state.json"
+    def _context_path(self, sid): return SESSION_DIR / sid / "context.json"
+
+    def _read_history(self, sid):
+        p = self._history_path(sid)
+        if p.exists():
+            try: return json.loads(p.read_text())
+            except: pass
+        return []
+
+    def _write_history(self, sid, data):
+        try: self._history_path(sid).write_text(json.dumps(data, indent=2))
+        except: pass
+
+    def _read_state(self, sid):
+        p = self._state_path(sid)
+        if p.exists():
+            try: return json.loads(p.read_text())
+            except: pass
+        return {}
+
+    def _write_state(self, sid, data):
+        try: self._state_path(sid).write_text(json.dumps(data, indent=2))
+        except: pass
+
+    def _read_context(self, sid):
+        p = self._context_path(sid)
+        if p.exists():
+            try: return json.loads(p.read_text())
+            except: pass
+        return {}
+
+    def _write_context(self, sid, data):
+        try: self._context_path(sid).write_text(json.dumps(data, indent=2))
+        except: pass
+
+sessions = SessionManager()
+
 def detect_message_type(text):
     text_lower = text.lower()
     reasoning_kw = ["explain", "how does", "why", "architecture", "design", "compare",
@@ -397,12 +523,10 @@ def parse_tool_calls(text):
 import curses
 
 class TUIChat:
-    def __init__(self, stdscr):
+    def __init__(self, stdscr, session_id=None):
         self.stdscr = stdscr
         self.api_key = load_api_key()
-        self.model = active_cache.get("balanced", PREFERRED_MODELS)
         self.conversation = []
-        self.current_chat_id = f"chat_{int(time.time())}"
         self.streaming = False
         self.stream_buffer = ""
         self.scroll_offset = 0
@@ -418,7 +542,43 @@ class TUIChat:
         self.last_ttft = None
         self.last_speed = None
         self.model_pool = PREFERRED_MODELS
+        self._session_id = session_id
 
+        if self._session_id and sessions.exists(self._session_id):
+            data = sessions.load(self._session_id)
+            if data:
+                for m in data.get("history", []):
+                    self.conversation.append(m)
+                st = data.get("state", {})
+                self.current_mode = st.get("mode", "balanced")
+                self.model = st.get("model", active_cache.get("balanced", PREFERRED_MODELS))
+                cwd = st.get("cwd", "")
+                if cwd:
+                    try: os.chdir(cwd)
+                    except: pass
+                sessions.set_last(self._session_id)
+        else:
+            if self._session_id:
+                sessions.create(self._session_id)
+                self._session_id = self._session_id
+            else:
+                last = sessions.get_last()
+                if last:
+                    self._session_id = last
+                    data = sessions.load(last)
+                    if data:
+                        for m in data.get("history", []):
+                            self.conversation.append(m)
+                        st = data.get("state", {})
+                        self.current_mode = st.get("mode", "balanced")
+                        self.model = st.get("model", active_cache.get("balanced", PREFERRED_MODELS))
+                    self.set_status(f"📂 Resumed: {last[:16]}...")
+                else:
+                    self._session_id = sessions.create()
+                    self.model = active_cache.get("balanced", PREFERRED_MODELS)
+                    self.set_status(f"🆕 Session: {self._session_id[:16]}...")
+
+        self.current_chat_id = f"chat_{int(time.time())}"
         model_scanner.start()
 
         curses.curs_set(1)
@@ -444,15 +604,25 @@ class TUIChat:
                     except: pass
         return files
 
+    def _auto_save(self):
+        if self._session_id and self.conversation:
+            sessions.save_conversation(self._session_id, self.conversation)
+            sessions.save_state(self._session_id, {
+                "model": self.model,
+                "mode": self.current_mode,
+                "cwd": os.getcwd(),
+            })
+
     def draw_header(self):
         active_models = active_cache.all_active()
-        md = self.model.split("/")[-1][:14]
+        md = self.model.split("/")[-1][:12]
         latency = latency_tracker.get_latency(self.model)
         ttft = latency.get("avg_ttft_ms")
         speed = latency.get("avg_stream_speed")
         mode_tag = {"fast": "⚡Fast", "balanced": "⚖️Bal", "reasoning": "🧠Deep"}
         tag = mode_tag.get(self.current_mode, "⚖️Bal")
-        left = f"  {tag} {md}"
+        sid_short = self._session_id[-12:] if self._session_id else "?"
+        left = f"  🧠 {sid_short} | {tag} {md}"
         if ttft: left += f" {ttft}ms"
         if speed: left += f" {speed}cps"
         status = "🌐" if self.api_key else "⚠️"
@@ -814,13 +984,8 @@ class TUIChat:
             if self.conversation and self.conversation[-1].get("_streaming"):
                 self.conversation[-1]["content"] = result
                 self.conversation[-1]["_streaming"] = False
-            save_chat_session({
-                "id": self.current_chat_id,
-                "model": self.model,
-                "mode": mode,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "messages": [{"role": m["role"], "content": m["content"]} for m in self.conversation if not m.get("_streaming")],
-            })
+            self._auto_save()
+            save_chat_session({"id": self.current_chat_id, "model": self.model, "mode": mode, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "messages": [{"role": m["role"], "content": m["content"]} for m in self.conversation if not m.get("_streaming")],})
             self.chat_list = load_chat_history()
             l = latency_tracker.get_latency(self.model)
             ttft = l.get("avg_ttft_ms")
@@ -888,8 +1053,42 @@ class TUIChat:
             self.add_message("system", r[:500])
             rc = r.split()[2] if r.startswith("exit ") and len(r.split()) > 2 else "?"
             self.set_status(f"✅ exit {rc}")
+        elif c == "/session":
+            if len(parts) < 2: self.set_status(f"🧠 Session: {self._session_id} | msgs: {len(self.conversation)}")
+            elif parts[1] == "save":
+                self._auto_save()
+                self.set_status(f"✅ Session saved: {self._session_id[:16]}...")
+            elif parts[1] == "rename" and len(parts) > 2:
+                sessions.rename(self._session_id, " ".join(parts[2:]))
+                self.set_status(f"✅ Renamed to: {' '.join(parts[2:])}")
+            elif parts[1] == "new":
+                self._session_id = sessions.create()
+                self.conversation = []; self.stream_buffer = ""; self.scroll_offset = 0
+                self.set_status(f"🆕 New session: {self._session_id[:16]}...")
+            elif parts[1] == "list":
+                lst = sessions.list_sessions()[:5]
+                info = " | ".join(f"{s['id'][:12]} ({s['message_count']}msgs)" for s in lst)
+                self.set_status(f"📋 {info}" if info else "📋 No sessions")
+            elif parts[1] == "load" and len(parts) > 2:
+                sid = parts[2]
+                if sessions.exists(sid):
+                    self._session_id = sid
+                    data = sessions.load(sid)
+                    self.conversation = data["history"] if data else []
+                    self.stream_buffer = ""; self.scroll_offset = 0
+                    if data:
+                        st = data.get("state", {})
+                        self.current_mode = st.get("mode", "balanced")
+                        self.model = st.get("model", active_cache.get("balanced", PREFERRED_MODELS))
+                    sessions.set_last(sid)
+                    self.set_status(f"📂 Loaded: {sid[:16]}...")
+                else: self.set_status(f"❌ No session: {sid}")
+            elif parts[1] == "delete" and len(parts) > 2:
+                sessions.delete(parts[2])
+                self.set_status(f"🗑️ Deleted: {parts[2][:16]}...")
+            else: self.set_status("Usage: /session <save|rename|new|list|load|delete>")
         elif c == "/project": self.set_status(f"📁 {len(self.project_files)} files")
-        elif c == "/help": self.set_status("/exit /clear /model /models /latency /key /write /read /run /project")
+        elif c == "/help": self.set_status("/exit /clear /model /models /latency /key /write /read /run /project /session")
         else: self.set_status(f"❌ Unknown: {c}")
 
     def get_model_count(self):
@@ -941,10 +1140,10 @@ class TUIChat:
                 self.input_buf = self.input_buf[:self.input_pos] + char + self.input_buf[self.input_pos:]
                 self.input_pos += 1
 
-def launch_tui():
+def launch_tui(session_id=None):
     api_key = load_api_key()
     if not api_key: return print("⚠️  No API key — use: termux-ai key <token>")
-    try: curses.wrapper(lambda s: TUIChat(s).run())
+    try: curses.wrapper(lambda s: TUIChat(s, session_id=session_id).run())
     except KeyboardInterrupt: pass
     except Exception as e: print(f"\nTUI error: {e}"); import traceback; traceback.print_exc()
 

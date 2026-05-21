@@ -5,21 +5,25 @@ Usage:
   python3 termux_ai_manager.py <command>
 
 Commands:
-  start       Start AI backend (fast check, no package installs)
-  stop        Stop background scanner daemon
-  restart     Graceful scanner restart
-  doctor      Run full diagnostics
-  doctor --repair  Full repair + install dependencies
-  update      Full system update (repair + deps + files)
-  scan        Run model scanner once
-  models      Show model scores & latency
-  status      Show system health
-  sync        Git push/pull all projects
-  clone <url> Clone GitHub repo
-  key <token> Set OpenRouter API key
-  list        List all projects
-  tui         Launch full-screen TUI chat app
-  help        Show this help
+  start           Start AI backend (fast check, no package installs)
+  stop            Stop background scanner daemon
+  restart         Graceful scanner restart
+  doctor          Run full diagnostics
+  doctor --repair Full repair + install dependencies
+  update          Full system update (repair + deps + files)
+  scan            Run model scanner once
+  models          Show model scores & latency
+  status          Show system health
+  sync            Git push/pull all projects
+  clone <url>     Clone GitHub repo
+  key <token>     Set OpenRouter API key
+  list            List all projects
+  tui             Launch full-screen TUI chat app
+  chat -s <name>  Start named session
+  resume [id]     Resume last or named session
+  sessions        List saved sessions
+  delete-session <id>  Delete a session
+  help            Show this help
 """
 
 import sys, os, json, time, shutil, subprocess
@@ -183,6 +187,71 @@ def cmd_list():
     from project_manager import show_list
     show_list()
 
+def cmd_chat():
+    from tui_chat import launch_tui, sessions
+    key = load_api_key()
+    if not key:
+        log("⚠️  No API key — AI disabled. Use: termux-ai key <token>")
+        return
+    if "-s" in sys.argv:
+        idx = sys.argv.index("-s")
+        if len(sys.argv) > idx + 1:
+            name = sys.argv[idx + 1]
+            if sessions.exists(name):
+                launch_tui(session_id=name)
+            else:
+                sid = sessions.create(name=name)
+                launch_tui(session_id=sid)
+        else:
+            log("⚠️ Usage: termux-ai chat -s <name>")
+    else:
+        launch_tui()
+
+def cmd_resume():
+    from tui_chat import launch_tui, sessions
+    key = load_api_key()
+    if not key:
+        log("⚠️  No API key — AI disabled. Use: termux-ai key <token>")
+        return
+    if len(sys.argv) > 2:
+        sid = sys.argv[2]
+        if sessions.exists(sid):
+            launch_tui(session_id=sid)
+        else:
+            log(f"❌ Session not found: {sid}")
+    else:
+        last = sessions.get_last()
+        if last:
+            launch_tui(session_id=last)
+        else:
+            log("⚠️ No last session — starting fresh")
+            launch_tui()
+
+def cmd_sessions():
+    from tui_chat import sessions
+    lst = sessions.list_sessions()
+    if not lst:
+        log("📋 No saved sessions")
+        return
+    print(f"{'ID':<24} {'Name':<20} {'Msgs':>5} {'Model':<30} {'Updated':<20}")
+    print("-" * 99)
+    for s in lst:
+        name = s.get("name", "")[:18]
+        mid = s["model"].split("/")[-1][:28] if s.get("model") else ""
+        print(f"{s['id']:<24} {name:<20} {s['message_count']:>5} {mid:<30} {s['updated'][:19]:<20}")
+
+def cmd_delete_session():
+    if len(sys.argv) < 3:
+        log("❌ Usage: termux-ai delete-session <id>")
+        return
+    from tui_chat import sessions
+    sid = sys.argv[2]
+    if sessions.exists(sid):
+        sessions.delete(sid)
+        log(f"🗑️ Deleted: {sid}")
+    else:
+        log(f"❌ Session not found: {sid}")
+
 def cmd_help():
     print(__doc__)
 
@@ -195,7 +264,8 @@ def main():
         "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
         "doctor": cmd_doctor, "scan": cmd_scan, "models": cmd_models,
         "status": cmd_status, "sync": cmd_sync, "list": cmd_list,
-        "tui": cmd_tui,
+        "tui": cmd_tui, "chat": cmd_chat, "resume": cmd_resume,
+        "sessions": cmd_sessions, "delete-session": cmd_delete_session,
         "update": cmd_update, "help": cmd_help,
     }
 
