@@ -17,7 +17,7 @@ After install, reload your shell:
 source ~/.bashrc
 ```
 
-Grant storage permission if prompted:
+Grant storage permission:
 ```bash
 termux-setup-storage
 ```
@@ -88,6 +88,8 @@ termux-ai start
     ├── my-python-bot/
     └── ...
 ```
+
+The `termux-ai` command is a 5-line Bash wrapper that delegates everything to `termux_ai_manager.py`. All Python scripts run through the `python3` interpreter — never executed directly as binaries.
 
 ## Self-Healing System
 
