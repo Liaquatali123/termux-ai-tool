@@ -58,11 +58,11 @@ else
   err "ai_openrouter/ not found alongside install.sh"
 fi
 
-# === Step 5: Install termux-ai command ===
-info "Installing 'termux-ai' command..."
-cp "$SCRIPT_DIR/termux_ai_manager.sh" "$BIN_DIR/termux-ai"
+# === Step 5: Install termux-ai command (Python) ===
+info "Installing 'termux-ai' command (Python)..."
+cp "$SCRIPT_DIR/ai_openrouter/termux-ai" "$BIN_DIR/termux-ai"
 chmod +x "$BIN_DIR/termux-ai"
-ok "termux-ai → $BIN_DIR/termux-ai"
+ok "termux-ai → $BIN_DIR/termux-ai (Python engine)"
 
 # === Step 6: Create aliases ===
 info "Adding aliases to ~/.bashrc..."
