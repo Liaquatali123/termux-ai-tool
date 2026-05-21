@@ -23,6 +23,10 @@ def verify():
     md = missing_deps()
     if md:
         print(f"⚠️  {len(md)} dep(s) missing — run: termux-ai doctor --repair")
+
+    # Ensure all .py files are readable
+    for py in AI.glob("*.py"):
+        py.chmod(0o644)
     if not SCANNER.exists():
         FREE = AI / "free_model_scanner.py"
         if FREE.exists():

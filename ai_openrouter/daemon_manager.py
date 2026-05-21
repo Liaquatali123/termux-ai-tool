@@ -44,10 +44,12 @@ def start(api_key):
 
     try:
         print("🧠 Launching scanner via python3")
+        # Ensure file is readable by the interpreter
+        SCANNER.chmod(0o644)
         proc = subprocess.Popen(
             [sys.executable, os.fsdecode(SCANNER), api_key, "--daemon"],
             stdout=open(LOG, "a"), stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, close_fds=True,
             start_new_session=True,
         )
         PID_FILE.write_text(str(proc.pid))

@@ -48,16 +48,19 @@ def main():
     ok(f"Storage: {AI}/")
     ok(f"Projects: {PROJECTS}/")
 
-    # 4. Deploy AI backend
+    # 4. Deploy AI backend (force overwrite all files)
     info("Deploying AI backend...")
     src = Path(__file__).parent / "ai_openrouter"
     if src.exists():
         for f in src.iterdir():
             target = AI / f.name
-            if f.is_file() and not target.exists():
+            if f.is_file():
                 shutil.copy2(str(f), str(target))
+                # Ensure .py files are readable
+                if f.suffix == ".py":
+                    target.chmod(0o644)
         for py in AI.glob("*.py"):
-            py.chmod(0o755)
+            py.chmod(0o644)
         ok("AI backend files deployed")
     else:
         err("ai_openrouter/ not found alongside install.py")
